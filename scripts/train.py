@@ -51,7 +51,15 @@ def cfg_wrapper(
     te: ConcatTextEncoders,
     cfg: float = 5.0,
     use_normed_emb: bool = False,
+    aspect_ratio: torch.Tensor | None = None,
 ):
+    """
+    Build a CFG function that matches the conditioning used during FlowTrainer training.
+
+    - Text conditioning: same ConcatTextEncoders.encode path as training/inference_fm.
+    - Spatial conditioning: accepts an optional per-sample aspect_ratio tensor from the dataset.
+      If not provided, falls back to width / height (linear, no log) to match training.
+    """
     with torch.autocast("cuda", dtype=next(te.parameters()).dtype):
         normed_emb, emb, pool, mask = te.encode(
             prompt, padding="max_length", truncation=True
@@ -63,17 +71,7 @@ def cfg_wrapper(
         emb = normed_emb
         neg_emb = neg_normed_emb
 
-    if pool is not None:
-        # For SDXL-like arch
-        added_cond = {
-            "time_ids": torch.tensor([[height, width, 0, 0, height, width]])
-            .repeat(2, 1)
-            .to(emb),
-            "text_embeds": torch.concat([pool, neg_pool]),
-        }
-    else:
-        added_cond = {"addon_info": torch.log(torch.tensor([width / height])).to(emb)}
-
+    # Normalize prompt / negative prompt sequence length
     if emb.size(1) > neg_emb.size(1):
         pad_setting = (0, 0, 0, emb.size(1) - neg_emb.size(1))
         neg_emb = F.pad(neg_emb, pad_setting)
@@ -85,19 +83,68 @@ def cfg_wrapper(
         if mask is not None:
             mask = F.pad(mask, pad_setting[2:])
 
+    # Attention mask
     if mask is not None and neg_mask is not None:
         attn_mask = torch.concat([mask, neg_mask])
     else:
         attn_mask = None
     text_ctx_emb = torch.concat([emb, neg_emb])
 
-    def cfg_fn(x, t):
+    def cfg_fn(x, t, pos_map=None):
+        # pos_map: [B, N, 2] -> duplicate for cond/uncond
+        if pos_map is not None:
+            pos_map = pos_map.to(x)
+            pos_map = torch.cat([pos_map, pos_map], dim=0)
+
+        # Build added_cond_kwargs so that addon_info matches training distribution
+        if pool is not None:
+            # SDXL-like branch: use pooled text embedding + time_ids
+            batch = x.size(0)
+            time_ids = (
+                torch.tensor([[height, width, 0, 0, height, width]], device=x.device)
+                .repeat(batch * 2, 1)
+                .to(x.dtype)
+            )
+            text_embeds = torch.concat([pool, neg_pool], dim=0).to(x)
+            # If batch > pooled batch (should not happen), tile
+            if text_embeds.size(0) != batch * 2:
+                text_embeds = text_embeds[0:1].expand(batch * 2, -1)
+            added_cond = {
+                "time_ids": time_ids,
+                "text_embeds": text_embeds,
+            }
+        else:
+            # FlowTrainer training uses a single scalar addon_info per sample:
+            #   aspect_ratio = width / height  (NO log).
+            if aspect_ratio is not None:
+                ar = aspect_ratio.to(device=x.device, dtype=x.dtype).reshape(-1)
+            else:
+                ar_value = float(width) / float(height)
+                ar = torch.full(
+                    (x.size(0),),
+                    ar_value,
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+            # Duplicate for cond/uncond branch
+            if ar.numel() == x.size(0):
+                ar = ar.repeat(2)
+            elif ar.numel() != x.size(0) * 2:
+                # Fallback: broadcast a single scalar
+                ar = ar.reshape(-1)
+                if ar.numel() == 1:
+                    ar = ar.expand(x.size(0) * 2)
+                else:
+                    ar = ar[: x.size(0) * 2]
+            added_cond = {"addon_info": ar}
+
         cond, uncond = unet(
             torch.concat([x, x]),
             t.expand(x.size(0) * 2),
             encoder_hidden_states=text_ctx_emb,
             encoder_attention_mask=attn_mask,
             added_cond_kwargs=added_cond,
+            pos_map=pos_map,
         ).chunk(2)
         return uncond + (cond - uncond) * cfg
 
@@ -106,20 +153,44 @@ def cfg_wrapper(
 
 @torch.inference_mode()
 def sampling(pl_module: FlowTrainer, batch, config):
+    """
+    Training-time preview sampler.
+
+    This sampler matches FlowTrainer.training_step in terms of conditioning:
+    - Uses captions from the current batch.
+    - Reuses the batch's pos_map and addon_info (aspect ratio) instead of
+      recomputing them from scratch.
+    - Uses the same VAE standardization (vae_std / vae_mean) as training.
+    """
+    latents, captions, tokenizer_outputs, pos_map, *addon_info = batch
     te = pl_module.te
     bs = config["batch_size"]
-    captions = batch[1][: config["num"]]
+    captions = captions[: config["num"]]
     if len(captions) < config["num"]:
         captions = (captions * (config["num"] // len(captions) + 1))[: config["num"]]
+
+    # Align pos_map / addon_info with the preview subset
+    pos_map = pos_map[: config["num"]] if pos_map is not None else None
+    aspect_ratio = None
+    if len(addon_info) > 0 and isinstance(addon_info[0], dict):
+        aspect_ratio = addon_info[0].get("addon_info", None)
+        if aspect_ratio is not None:
+            aspect_ratio = aspect_ratio[: config["num"]]
 
     images = []
     device = pl_module.device
     vae.to(device)
-    size = config.get("size", 1024)
+    size = config.get("size", 256)
 
     with torch.autocast("cuda"):
         for i in range(0, config["num"], bs):
             current_caption = captions[i : i + bs]
+            current_pos_map = (
+                pos_map[i : i + bs] if pos_map is not None else None
+            )
+            current_ar = (
+                aspect_ratio[i : i + bs] if aspect_ratio is not None else None
+            )
             cfg_fn = cfg_wrapper(
                 current_caption,
                 [""] * len(current_caption),
@@ -129,15 +200,21 @@ def sampling(pl_module: FlowTrainer, batch, config):
                 te=te,
                 cfg=2.5,
                 use_normed_emb=pl_module.te_use_normed_ctx,
+                aspect_ratio=current_ar,
             )
             xt = torch.randn(len(current_caption), 4, size // 8, size // 8).to(device)
             t = 1.0
             dt = 1.0 / config["steps"]
             for _ in range(config["steps"]):
-                model_pred = cfg_fn(xt, torch.tensor(t, device=device))
-                xt = xt - dt * model_pred
+                model_pred = cfg_fn(
+                    xt,
+                    torch.tensor(t, device=device),
+                    pos_map=current_pos_map,
+                )
+                # Keep xt in higher precision to reduce numerical diffusion error
+                xt = xt - dt * model_pred.to(dtype=xt.dtype)
                 t -= dt
-            generated_latents = xt - LATENT_SHIFT
+            generated_latents = xt
             image_tensors = torch.concat(
                 [
                     vae.decode(

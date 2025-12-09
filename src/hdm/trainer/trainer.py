@@ -390,10 +390,11 @@ class FlowTrainer(BaseTrainer):
 
     def training_step(self, batch, idx):
         x, captions, tokenizer_outputs, pos_map, *addon_info = batch
+        vae_scale = 8
 
         if self.vae is not None:
             if pos_map is not None:
-                pos_map = pos_map.unflatten(1, x.shape[-2:])  # (B, H, W, 2)
+                pos_map = pos_map.unflatten(1, (x.shape[-2] // vae_scale, x.shape[-1] // vae_scale))  # (B, H, W, 2)
             with torch.no_grad():
                 x = x.to(self.device)
                 x = torch.concat(

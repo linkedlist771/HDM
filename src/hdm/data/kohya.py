@@ -69,6 +69,7 @@ class KohyaDataset(Data.Dataset):
         group_dropout_rate=0.3,
         use_cached_meta=True,
         meta_postfix="_filtered",
+        vae_scale=8,
     ):
         self.dataset_folder = dataset_folder
         if (
@@ -103,6 +104,7 @@ class KohyaDataset(Data.Dataset):
         self.group_dropout_rate = group_dropout_rate
 
         self.size = size
+        self.vae_scale = vae_scale
         self.transform = transform or transforms.Compose(
             [
                 transforms.Lambda(conver_rgb),
@@ -175,7 +177,7 @@ class KohyaDataset(Data.Dataset):
         else:
             img = img_t
 
-        return img, make_cropped_pos(crop_h, crop_w, target_h, target_w)
+        return img, make_cropped_pos(crop_h//self.vae_scale, crop_w//self.vae_scale, target_h//self.vae_scale, target_w//self.vae_scale)
 
     def _getitem(self, img_file, txt_file):
         img_t, caption = self.get_data_from_files(img_file, txt_file)

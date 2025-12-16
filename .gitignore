@@ -212,3 +212,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# 忽略 dataset 下所有文件，但保留文件夹结构
+dataset/**/*
+!dataset/**/.gitkeep
+!dataset/.gitkeep

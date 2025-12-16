@@ -38,7 +38,7 @@
         class = "hdm.data.kohya.KohyaDataset"
         [dataset.datasets.kwargs]
             size=1024
-            dataset_folder = "F:/dataset/multi_artist"
+            dataset_folder = "./dataset/firefly"
             keep_token_seperator="|||"
             tag_seperator=", "
             seperator=", "
